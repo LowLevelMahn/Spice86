@@ -201,6 +201,8 @@ public sealed class Dos {
         // Calculate initial PSP segment from configuration (PSP is 16 paragraphs before entry point)
         ushort initialPspSegment = (ushort)(configuration.ProgramEntryPointSegment - 0x10);
 
+        initialPspSegment = 0x1DD;
+
         // Initialize the SDA with the initial PSP segment
         DosSwappableDataArea.CurrentProgramSegmentPrefix = initialPspSegment;
 

@@ -14,6 +14,7 @@ using Spice86.Shared.Interfaces;
 using Spice86.Shared.Utils;
 
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 
@@ -125,7 +126,7 @@ public class DosProcessManager {
         }
     }
 
-    private DosProgramSegmentPrefix GetCurrentPsp() => 
+    private DosProgramSegmentPrefix GetCurrentPsp() =>
         new(_memory, MemoryUtils.ToPhysicalAddress(_sda.CurrentProgramSegmentPrefix, 0));
 
     public void TrackResidentBlock(DosMemoryControlBlock block) {
@@ -289,7 +290,8 @@ public class DosProcessManager {
         ushort callerIP, ushort callerCS, ushort parentPspSegment, string hostPath,
         DosMemoryControlBlock? envBlock, DosExeFile exeFile,
         ushort parentSS, ushort parentReservedSP) {
-        DosMemoryControlBlock? block = _memoryManager.ReserveSpaceForExe(exeFile);
+        ushort wantedPsSegment = 0; // 0x1DD
+        DosMemoryControlBlock? block = _memoryManager.ReserveSpaceForExe(exeFile, wantedPsSegment);
         if (block is null) {
             // Free the environment block we just allocated
             if (envBlock is not null) {
@@ -304,7 +306,10 @@ public class DosProcessManager {
             block.Size, hostPath, commandTail,
             finalEnvironmentSegment, parentPspSegment,
             callerCS, callerIP);
-        DosProgramSegmentPrefix exePsp = new(_memory, MemoryUtils.ToPhysicalAddress(block.DataBlockSegment, 0));
+
+        ushort pspSegment = block.DataBlockSegment;
+
+        DosProgramSegmentPrefix exePsp = new(_memory, MemoryUtils.ToPhysicalAddress(pspSegment, 0));
         // FreeDOS: parent PSP's ps_stack field stores the parent's current iregs frame (only for LoadAndExecute).
         if (loadType == DosExecLoadType.LoadAndExecute) {
             DosProgramSegmentPrefix parentPsp = new(_memory, MemoryUtils.ToPhysicalAddress(parentPspSegment, 0));
@@ -312,24 +317,23 @@ public class DosProcessManager {
         }
         CopyFcbFromPointer(paramBlock.FirstFcbPointer, exePsp.FirstFileControlBlock);
         CopyFcbFromPointer(paramBlock.SecondFcbPointer, exePsp.SecondFileControlBlock);
-        LoadExeFile(exeFile, block.DataBlockSegment, block, loadType == DosExecLoadType.LoadAndExecute);
 
-        ushort loadImageSegment = (ushort)(block.DataBlockSegment + DosProgramSegmentPrefix.PspSizeInParagraphs);
-        if (exeFile.MinAlloc == 0 && exeFile.MaxAlloc == 0) {
-            ushort imageDistanceInParagraphs = (ushort)(block.Size - exeFile.ProgramSizeInParagraphsPerHeader);
-            loadImageSegment = (ushort)(block.DataBlockSegment + imageDistanceInParagraphs);
-        }
+        ushort loadSegment = calcLoadSegment(exeFile, pspSegment, block);
+        LoadExeFile(exeFile, pspSegment, loadSegment, loadType == DosExecLoadType.LoadAndExecute);
+
         SetupAxAndBxWithFcbValuesForExecute(loadType, exePsp);
 
         RestoreParentPspForLoadOnly(loadType, parentPspSegment);
 
         DosExecResult exeResult;
+        ushort relocatedCS = (ushort)(exeFile.InitCS + loadSegment);
+        ushort relocatedSS = (ushort)(exeFile.InitSS + loadSegment);
         if (loadType == DosExecLoadType.LoadOnly) {
-            exeResult = DosExecResult.SuccessLoadOnly((ushort)(exeFile.InitCS + loadImageSegment), exeFile.InitIP,
-            (ushort)(exeFile.InitSS + loadImageSegment), exeFile.InitSP);
+            exeResult = DosExecResult.SuccessLoadOnly(relocatedCS, exeFile.InitIP,
+            relocatedSS, exeFile.InitSP);
         } else {
-            exeResult = DosExecResult.SuccessExecute((ushort)(exeFile.InitCS + loadImageSegment), exeFile.InitIP,
-            (ushort)(exeFile.InitSS + loadImageSegment), exeFile.InitSP);
+            exeResult = DosExecResult.SuccessExecute(relocatedCS, exeFile.InitIP,
+            relocatedSS, exeFile.InitSP);
         }
 
         // For AL=01 (Load Only), DOS fills the EPB with initial CS:IP and SS:SP.
@@ -346,6 +350,14 @@ public class DosProcessManager {
 
         // MS-DOS and FreeDOS: COM files are ALWAYS loaded in the largest available area
         DosMemoryControlBlock largestFree = _memoryManager.FindLargestFree();
+#if false
+        ushort wantedPspSegment = 0x1DD;
+        if (wantedPspSegment != 0) {
+            bool result = _memoryManager.TryGettingLargestDatablockStartAtSegment(largestFree, wantedPspSegment, out largestFree);
+            Debug.Assert(result);
+        }
+#endif
+
         DosMemoryControlBlock? comBlock = _memoryManager.AllocateMemoryBlock(largestFree.Size);
 
         if (comBlock is null || largestFree.Size < paragraphsNeeded) {
@@ -1003,29 +1015,34 @@ public class DosProcessManager {
         _state.InterruptFlag = true;
     }
 
-    private void LoadExeFile(DosExeFile exeFile, ushort pspSegment, DosMemoryControlBlock block, bool updateCpuState) {
-        if (_loggerService.IsEnabled(LogEventLevel.Verbose)) {
-            _loggerService.Verbose("Read header: {ReadHeader}", exeFile);
-        }
-        ushort pspLoadSegment = block.DataBlockSegment;
+    private static ushort calcLoadSegment(DosExeFile exeFile, ushort pspSegment, DosMemoryControlBlock block) {
         // The program image is loaded immediately above the PSP, which is the start of
         // the memory block that we just allocated.
         // Jump over the PSP to get the EXE image segment.
-        ushort loadImageSegment = (ushort)(pspLoadSegment + DosProgramSegmentPrefix.PspSizeInParagraphs);
+        ushort loadSegment = (ushort)(pspSegment + DosProgramSegmentPrefix.PspSizeInParagraphs);
 
         // Adjust image load segment when PSP and exe image gets splitted due to load into high memory
         if (exeFile.MinAlloc == 0 && exeFile.MaxAlloc == 0) {
             ushort imageDistanceInParagraphs = (ushort)(block.Size - exeFile.ProgramSizeInParagraphsPerHeader);
-            loadImageSegment = (ushort)(pspLoadSegment + imageDistanceInParagraphs);
+            loadSegment = (ushort)(pspSegment + imageDistanceInParagraphs);
         }
-        LoadExeFileInMemoryAndApplyRelocations(exeFile, loadImageSegment, loadImageSegment);
+
+        return loadSegment;
+    }
+
+    private void LoadExeFile(DosExeFile exeFile, ushort pspSegment, ushort loadSegment, bool updateCpuState) {
+        if (_loggerService.IsEnabled(LogEventLevel.Verbose)) {
+            _loggerService.Verbose("Read header: {ReadHeader}", exeFile);
+        }
+
+        LoadExeFileInMemoryAndApplyRelocations(exeFile, loadSegment, loadSegment);
         if (updateCpuState) {
-            SetupCpuForExe(exeFile, loadImageSegment, pspSegment);
+            SetupCpuForExe(exeFile, loadSegment, pspSegment);
         }
     }
 
-    private void LoadExeFileInMemoryAndApplyRelocations(DosExeFile exeFile, ushort loadImageSegment, ushort relocationSegment) {
-        uint physicalLoadAddress = MemoryUtils.ToPhysicalAddress(loadImageSegment, 0);
+    private void LoadExeFileInMemoryAndApplyRelocations(DosExeFile exeFile, ushort loadSegment, ushort relocationSegment) {
+        uint physicalLoadAddress = MemoryUtils.ToPhysicalAddress(loadSegment, 0);
         _memory.LoadData(physicalLoadAddress, exeFile.ProgramImage, (int)exeFile.ProgramSize);
         foreach (SegmentedAddress address in exeFile.RelocationTable) {
             // Read value from memory, add the relocation segment offset and write back
@@ -1057,11 +1074,12 @@ public class DosProcessManager {
         // Finally, MS-DOS reads the initial CS and IP values from the program's file
         // header, adjusts the CS register value by adding the start-segment address to
         // it, and transfers control to the program at the adjusted address.
+        ushort relocatedCS = (ushort)(exeFile.InitCS + loadSegment);
         if (_loggerService.IsEnabled(LogEventLevel.Verbose)) {
             _loggerService.Verbose("SetupCpuForExe: InitCS={InitCS:X4}, InitIP={InitIP:X4}, loadSegment={LoadSegment:X4}, final CS={FinalCS:X4}",
-                exeFile.InitCS, exeFile.InitIP, loadSegment, (ushort)(exeFile.InitCS + loadSegment));
+                exeFile.InitCS, exeFile.InitIP, loadSegment, relocatedCS);
         }
-        SetEntryPoint((ushort)(exeFile.InitCS + loadSegment), exeFile.InitIP);
+        SetEntryPoint(relocatedCS, exeFile.InitIP);
     }
 
     private void SetEntryPoint(ushort cs, ushort ip) {

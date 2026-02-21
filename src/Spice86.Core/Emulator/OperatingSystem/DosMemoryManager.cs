@@ -9,6 +9,8 @@ using Spice86.Core.Emulator.OperatingSystem.Structures;
 using Spice86.Shared.Interfaces;
 using Spice86.Shared.Utils;
 
+using System.Buffers;
+using System.Diagnostics;
 using System.Linq;
 
 /// <summary>
@@ -53,14 +55,14 @@ public class DosMemoryManager {
         // The MCB starts 1 paragraph (16 bytes) before the 16 paragraph (256 bytes) PSP. Since
         // we're the memory manager, we're the one who needs to read the MCB, so we need to start
         // with its address by subtracting 1 paragraph from the PSP.
-        ushort loadSegment = (ushort)(pspSegment - 1);
-        _start = GetDosMemoryControlBlockFromSegment(loadSegment);
-        // LastFreeSegment and loadSegment are both valid segments that may be allocated, so we
+        ushort mcbSegment = (ushort)(pspSegment - 1);
+        _start = GetDosMemoryControlBlockFromSegment(mcbSegment);
+        // LastFreeSegment and mcbSegment are both valid segments that may be allocated, so we
         // need to add 1 paragraph to the result to ensure that our calculated size doesn't exclude
         // LastFreeSegment from being allocated. Some games do their own math to calculate the
         // maximum free conventional memory from the last block that was allocated rather than
         // asking the memory manager, and if we were off by one, allocation would fail.
-        ushort size = (ushort)((LastFreeSegment - loadSegment) + 1);
+        ushort size = (ushort)((LastFreeSegment - mcbSegment) + 1);
         // We adjusted the start address above so that it starts with the MCB, but the MCB itself
         // isn't actually useable space. We need it here in the DOS memory manager for accounting.
         // Therefore subtract the size of the MCB (1 paragraph, which is 16 bytes) from the total
@@ -245,19 +247,19 @@ public class DosMemoryManager {
     /// manager or actually loading the executable into memory.
     /// </remarks>
     /// <param name="exeFile">EXE file header that defines the amount of space we need.</param>
-    /// <param name="pspSegment">Segment address where the PSP before the EXE will be loaded.</param>
+    /// <param name="wantedPspSegment">Segment address where the PSP before the EXE will be loaded.</param>
     /// <returns>
     /// The <see cref="DosMemoryControlBlock"/> allocated for the program and its stack,
     /// or <c>null</c> if no memory block was allocated.
     /// </returns>
-    public DosMemoryControlBlock? ReserveSpaceForExe(DosExeFile exeFile, ushort pspSegment = 0) {
-        AllocRange size = CalculateSizeForExe(exeFile, pspSegment);
+    public DosMemoryControlBlock? ReserveSpaceForExe(DosExeFile exeFile, ushort wantedPspSegment = 0) {
+        AllocRange size = CalculateSizeForExe(exeFile, wantedPspSegment);
 
         // Since segment zero is well within the reserved space for interrupt vectors and BIOS data,
         // we use it as a sentinel to indicate that no specific segment address was requested, and
         // that we should just allocate the next available block where the program will fit.
         // Otherwise we try to allocate memory starting at the requested segment.
-        DosMemoryControlBlock? block = (pspSegment == 0)
+        DosMemoryControlBlock? block = (wantedPspSegment == 0)
             // This is the normal, expected case during DOS LOAD/EXEC. We just ask the allocator to
             // find a block that will fit the maximum size requested by the EXE, and if it can't
             // find that, we ask it to find a block that fits the minimum required size. It doesn't
@@ -270,7 +272,7 @@ public class DosMemoryManager {
             // the first program and the whole conventional memory space is available. You may use
             // it after that, but you should be well aware of the higher risk of allocation failing
             // than if you just allow the allocator to find the largest suitable block if you do so.
-            : AllocateMemoryRange(pspSegment, size);
+            : AllocateMemoryRange(wantedPspSegment, size);
 
         if (block is not null) {
             // Since we know that we're allocating a memory block for a new program, and the PSP
@@ -292,7 +294,7 @@ public class DosMemoryManager {
                 "{SizeInParagraphs} paragraphs ({SizeInBytes} bytes) are not available at {PspSegment} to load program",
                 size.MinSizeInParagraphs,
                 size.MinSizeInParagraphs * 16,
-                ConvertUtils.ToHex16(pspSegment));
+                ConvertUtils.ToHex16(wantedPspSegment));
         }
 
         return block;
@@ -336,9 +338,9 @@ public class DosMemoryManager {
     /// blocks in some cases. It's more complicated that it may seem on the surface.
     /// </remarks>
     /// <param name="exeFile">EXE file header that defines the amount of space we need.</param>
-    /// <param name="pspSegment">Segment address where the PSP before the EXE will be loaded.</param>
+    /// <param name="wantedPspSegment">try to force the segment address where the PSP before the EXE will be allocated.</param>
     /// <returns>The calculated minimum required and maximum requested allocation sizes.</returns>
-    private AllocRange CalculateSizeForExe(DosExeFile exeFile, ushort pspSegment) {
+    private AllocRange CalculateSizeForExe(DosExeFile exeFile, ushort wantedPspSegment) {
         // Every program requires at least enough space for itself and the 16 paragraph (256 byte)
         // PSP that precedes it.
         ushort baseSizeInParagraphs = (ushort)(exeFile.ProgramSizeInParagraphsPerHeader + 0x10);
@@ -357,27 +359,20 @@ public class DosMemoryManager {
         // format (wiki.osdev.org/MZ) for more information.
         if (exeFile.MinAlloc == 0 && exeFile.MaxAlloc == 0 || maxSizeWithOverflow > maxSizeInParagraphs) {
             ushort freeSizeInParagraphs = 0;
-            if (pspSegment == 0) {
-                // This is what real DOS does. It always finds the largest free block that it can
-                // allocate. It's simple and relatively easy.
-                DosMemoryControlBlock largestFreeBlock = FindLargestFree();
-                if (largestFreeBlock.IsValid) {
-                    freeSizeInParagraphs = largestFreeBlock.Size;
-                }
-            } else {
-                // This behavior is unique to Spice86. Real DOS doesn't support loading a program at
-                // a specific address. It always allocates a new block for it. However to support
-                // loading a program at the location specified in the configuration at
-                // initialization time, we support it. It's handy for reverse engineering to ensure
-                // that the load address is always the same. Rather than finding the largest free
-                // block, we just allocate the size of the block at the given address as long as it
-                // is free.
-                DosMemoryControlBlock requestedBlock = GetDosMemoryControlBlockFromSegment(
-                    (ushort)(pspSegment - 1));
-                if (requestedBlock.IsValid && requestedBlock.IsFree) {
-                    freeSizeInParagraphs = requestedBlock.Size;
-                }
+
+            // This is what real DOS does. It always finds the largest free block that it can
+            // allocate. It's simple and relatively easy.
+            DosMemoryControlBlock largestFreeBlock = FindLargestFree();
+            if (largestFreeBlock.IsValid) {
+                freeSizeInParagraphs = largestFreeBlock.Size;
             }
+
+#if true
+            if (wantedPspSegment != 0) {
+                bool result = TryGettingLargestDatablockStartAtSegment(largestFreeBlock, wantedPspSegment, out largestFreeBlock);
+                Debug.Assert(result);
+            }
+#endif
 
             // It's possible that we didn't find a suitable free block, or that the block that we
             // found isn't large enough to hold the PSP and the program image. Since the default
@@ -610,7 +605,7 @@ public class DosMemoryManager {
                     break;
 
                 case (byte)DosMemoryAllocationStrategy.LastFit: // Last fit - take the last one (highest address)
-                    // Since we iterate from low to high addresses, always update to the current
+                                                                // Since we iterate from low to high addresses, always update to the current
                     selectedBlock = current;
                     break;
             }
@@ -710,6 +705,51 @@ public class DosMemoryManager {
 
         block.SetFree();
         JoinBlocks(_start, true);
+        return true;
+    }
+
+    private static bool initialProgrammExecution = true;
+
+    public bool TryGettingLargestDatablockStartAtSegment(DosMemoryControlBlock orignalBlock, ushort wantedSegment, out DosMemoryControlBlock resultBlock) {
+        resultBlock = orignalBlock;
+
+        // only the inital exe/com file can force the PSP start
+        // sub executed exe/com files are positioned as normal
+        if (initialProgrammExecution) {
+            initialProgrammExecution = false;
+        } else {
+            return true;
+        }
+
+        // This behavior is unique to Spice86. Real DOS doesn't support loading a program at
+        // a specific address. It always allocates a new block for it. However to support
+        // loading a program at the location specified in the configuration at
+        // initialization time, we support it. It's handy for reverse engineering to ensure
+        // that the load address is always the same. Rather than finding the largest free
+        // block, we just allocate the size of the block at the given address as long as it
+        // is free.
+
+        ushort beginSeg = orignalBlock.DataBlockSegment;
+        ushort endSeg = (ushort)(beginSeg + orignalBlock.Size);
+        bool found = wantedSegment >= beginSeg && wantedSegment < endSeg;
+        if (!found) {
+            return false;
+        }
+
+        // reduce the block by distance to our wanted PSPSegment - MCB-Size(1 paragraph)
+        ushort newSize = (ushort)(wantedSegment - orignalBlock.DataBlockSegment - 1);
+        DosMemoryControlBlock modifiedBlock;
+        DosErrorCode err = TryModifyBlock(beginSeg, newSize, out modifiedBlock);
+        Debug.Assert(err == DosErrorCode.NoError);
+        Debug.Assert(modifiedBlock.Size == newSize);
+
+        DosMemoryControlBlock pspBlock = modifiedBlock.GetNextOrDefault()!;
+        Debug.Assert(pspBlock.IsValid);
+        Debug.Assert(pspBlock.IsFree);
+        Debug.Assert(pspBlock.DataBlockSegment == wantedSegment);
+
+        resultBlock = pspBlock;
+
         return true;
     }
 }
